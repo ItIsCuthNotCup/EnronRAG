@@ -5,6 +5,12 @@
 vector_db/
 embeddings/
 
+# Large data files that exceed GitHub limits
+data/enron_emails.csv
+pre_built_db.zip
+*.zip
+*.csv
+
 # Configuration files that might contain sensitive info
 .env
 credentials.json
