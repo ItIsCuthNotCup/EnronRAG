@@ -1,0 +1,6 @@
+The Enron email vector database is located at:
+C:\Users\Jacob\OneDrive\Desktop\AI Testing\Enron RAG\vector_db\chroma
+
+Size: 1052.62 MB
+Created: 2025-03-09 19:47:53
+Contains: 195640 text chunks from 25000 emails
