@@ -1,0 +1,38 @@
+# Vector database files (these can be large and regenerated)
+*.vec
+*.idx
+*.bin
+vector_db/
+embeddings/
+
+# Configuration files that might contain sensitive info
+.env
+credentials.json
+secrets.toml
+
+# Cache and temporary files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.cache
+*.log
+
+# Environment directories
+venv/
+env/
+ENV/
+.venv/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo 
