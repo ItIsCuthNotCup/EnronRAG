@@ -2,14 +2,24 @@
 *.vec
 *.idx
 *.bin
-vector_db/
-embeddings/
+vector_db/*.vec
+vector_db/*.idx
+vector_db/*.bin
+vector_db/*.zip
+vector_db/vectors/
+vector_db/chunks/
+vector_db/indexes/
+# But allow Python files
+!vector_db/*.py
+!vector_db/__init__.py
 
 # Large data files that exceed GitHub limits
 data/enron_emails.csv
 pre_built_db.zip
 *.zip
 *.csv
+# But allow small files
+!data/sample_email.txt
 
 # Configuration files that might contain sensitive info
 .env
