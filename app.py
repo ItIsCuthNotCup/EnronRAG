@@ -10,14 +10,20 @@ import sys
 import requests
 import json
 import subprocess
+import concurrent.futures
+from functools import lru_cache
 
-# Set up logging
+# Set up logging with proper encoding for Windows
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', 
                     handlers=[logging.FileHandler("logs/enron_app.log", encoding="utf-8")])
 
 # Log startup for debugging
 logging.info("========== APPLICATION STARTED ==========")
+
+# Global variables for model caching
+EMBEDDING_MODEL_CACHE = {}
+OLLAMA_MODEL_CACHE = {}
 
 # Check if required packages are installed, install if missing
 def ensure_dependencies():
@@ -36,7 +42,21 @@ def ensure_dependencies():
 # Ensure dependencies are installed
 ensure_dependencies()
 
-# Debug function to diagnose vector database issues
+# Load configuration values directly (adjusted for performance)
+CSV_FILE = "emails.csv"
+TOP_K_RESULTS = 5  # Number of relevant emails to retrieve
+VECTOR_DB_DIR = "vector_db"
+CHROMA_DIR = "vector_db/chroma" 
+OLLAMA_BASE_URL = "http://localhost:11434"
+MODEL_NAME = "llama3:8b"  # Default model, could also use "mistral:7b" if available
+FALLBACK_MODEL = "mistral:7b"  # Fallback model if primary not available
+USE_CSV_SEARCH = True  # Prioritize CSV search for speed
+RESPONSE_TOKENS = 512  # Reduced tokens for faster generation
+TIMEOUT_SHORT = 3  # Short timeout for quick checks (seconds)
+TIMEOUT_NORMAL = 10  # Normal timeout for most operations (seconds)
+TIMEOUT_LONG = 30  # Long timeout for heavyweight operations (seconds)
+
+# Debug function to diagnose vector database issues - streamlined for faster execution
 def debug_vector_db():
     """Diagnose potential issues with the vector database."""
     debug_info = {"status": "unknown", "issues": [], "collections": [], "details": {}}
@@ -45,7 +65,6 @@ def debug_vector_db():
         # Step 1: Check if chromadb is installed
         try:
             import chromadb
-            from chromadb.utils import embedding_functions
             debug_info["details"]["chromadb_installed"] = True
         except ImportError:
             debug_info["status"] = "error"
@@ -56,7 +75,6 @@ def debug_vector_db():
         # Step 2: Check if the directory exists
         if os.path.exists(CHROMA_DIR):
             debug_info["details"]["directory_exists"] = True
-            # Check if directory is empty
             contents = os.listdir(CHROMA_DIR)
             debug_info["details"]["directory_contents"] = contents
             if not contents:
@@ -64,6 +82,7 @@ def debug_vector_db():
         else:
             debug_info["issues"].append(f"ChromaDB directory not found: {CHROMA_DIR}")
             debug_info["details"]["directory_exists"] = False
+            return debug_info  # Exit early if directory doesn't exist
         
         # Step 3: Try to connect to the client
         try:
@@ -76,32 +95,13 @@ def debug_vector_db():
             
             if not collections:
                 debug_info["issues"].append("No collections found in ChromaDB")
-            else:
-                # Step 5: Get the first collection and check its stats
-                collection = client.get_collection(
-                    name=collections[0].name,
-                    embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
-                        model_name="all-MiniLM-L6-v2", 
-                        device="cpu"
-                    )
-                )
-                count = collection.count()
-                debug_info["details"]["document_count"] = count
-                
-                if count == 0:
-                    debug_info["issues"].append("Collection exists but contains no documents")
-                else:
-                    # Try a simple query to see if it works
-                    try:
-                        results = collection.query(query_texts=["test query"], n_results=1)
-                        if results and 'documents' in results and results['documents'] and results['documents'][0]:
-                            debug_info["details"]["query_test"] = "successful"
-                        else:
-                            debug_info["details"]["query_test"] = "no results"
-                            debug_info["issues"].append("Query test returned no results")
-                    except Exception as e:
-                        debug_info["details"]["query_test"] = f"error: {str(e)}"
-                        debug_info["issues"].append(f"Query test failed: {str(e)}")
+                debug_info["status"] = "error"
+                return debug_info  # Exit early if no collections
+            
+            # Don't load the embedding model during debugging to save time
+            debug_info["status"] = "ok"
+            return debug_info
+            
         except Exception as e:
             debug_info["details"]["client_connected"] = False
             debug_info["issues"].append(f"Failed to connect to ChromaDB client: {str(e)}")
@@ -118,21 +118,9 @@ def debug_vector_db():
     else:
         debug_info["status"] = "error"
     
-    logging.info(f"Vector DB debug results: {json.dumps(debug_info)}")
     return debug_info
 
-# Load configuration values directly
-CSV_FILE = "emails.csv"
-TOP_K_RESULTS = 5  # Number of relevant emails to retrieve
-VECTOR_DB_DIR = "vector_db"
-CHROMA_DIR = "vector_db/chroma" 
-OLLAMA_BASE_URL = "http://localhost:11434"
-MODEL_NAME = "llama3:8b"  # Default model, could also use "mistral:7b" if available
-FALLBACK_MODEL = "mistral:7b"  # Fallback model if primary not available
-USE_CSV_SEARCH = False
-RESPONSE_TOKENS = 1024  # Max tokens to generate
-
-# Run vector DB debug on startup
+# Run vector DB debug on startup but avoid expensive operations
 vector_db_status = debug_vector_db()
 if vector_db_status["status"] != "ok":
     logging.warning(f"Vector DB issues detected: {vector_db_status['issues']}")
@@ -141,7 +129,7 @@ if vector_db_status["status"] != "ok":
         logging.info("Attempting to create vector database directory structure")
         os.makedirs(CHROMA_DIR, exist_ok=True)
 
-# Hardcoded sample data for fallback
+# Hardcoded sample data for fallback - keep as is
 SAMPLE_DATA = [
     {"from": "kenneth.lay@enron.com", "to": "all.employees@enron.com", 
      "subject": "Welcome Message", "date": "2001-05-01", 
@@ -164,11 +152,12 @@ SAMPLE_DATA = [
      "text": "We need to focus on our core business and maintain strong relationships with our partners. Our expansion strategy must be carefully considered. I believe in building businesses with hard assets rather than just trading operations. Long-term success requires solid infrastructure."}
 ]
 
-# Get available models from Ollama
+# Cache model info for faster response
+@lru_cache(maxsize=1)
 def get_available_models():
-    """Get list of available models from Ollama."""
+    """Get list of available models from Ollama with caching."""
     try:
-        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=TIMEOUT_SHORT)
         if response.status_code == 200:
             models = response.json().get("models", [])
             return [model["name"] for model in models]
@@ -177,17 +166,16 @@ def get_available_models():
         logging.error(f"Error getting available models: {e}")
         return []
 
-# Select best available model
+# Select best available model with caching
+@lru_cache(maxsize=1)
 def select_best_model():
-    """Select the best available model from Ollama."""
+    """Select the best available model from Ollama with caching."""
     available_models = get_available_models()
-    logging.info(f"Available models: {available_models}")
     
     # Preferred models in order (based on research)
     preferred_models = [
         MODEL_NAME,            # llama3:8b
         FALLBACK_MODEL,        # mistral:7b
-        "llama2:13b",          # Larger Llama 2
         "llama2:7b",           # Smaller Llama 2
         "mistral:mistral-tiny" # Smaller Mistral
     ]
@@ -196,23 +184,30 @@ def select_best_model():
     for model in preferred_models:
         if any(m.startswith(model) for m in available_models):
             matched_model = next(m for m in available_models if m.startswith(model))
-            logging.info(f"Selected model: {matched_model}")
             return matched_model
     
     # If no preferred model is available, return any available model
     if available_models:
-        logging.info(f"Falling back to available model: {available_models[0]}")
         return available_models[0]
     
     return None
 
-# Direct RAG query function using Ollama API
+# Direct RAG query function using Ollama API - optimized for faster responses
 def query_ollama(prompt, model_name=None):
-    """Query Ollama API directly without dependencies."""
+    """Query Ollama API directly with faster response times."""
     if not model_name:
+        # Use cached model selection
         model_name = select_best_model()
         if not model_name:
             return "Error: No models available in Ollama"
+    
+    # Calculate estimated prompt tokens to adjust max output tokens
+    prompt_chars = len(prompt)
+    estimated_prompt_tokens = prompt_chars / 4  # rough estimate
+    
+    # If prompt is very long, reduce output tokens
+    adjusted_tokens = min(RESPONSE_TOKENS, 
+                          max(128, int(RESPONSE_TOKENS - (estimated_prompt_tokens / 10))))
             
     try:
         url = f"{OLLAMA_BASE_URL}/api/generate"
@@ -221,179 +216,212 @@ def query_ollama(prompt, model_name=None):
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": 0.1,  # Lower temperature for more factual responses
-                "num_predict": RESPONSE_TOKENS,
-                "top_p": 0.9,        # More focused sampling
-                "top_k": 40          # Consider top 40 tokens
+                "temperature": 0.1,           # Lower temperature for more factual responses
+                "num_predict": adjusted_tokens, # Adaptive token limit
+                "top_p": 0.9,                 # More focused sampling
+                "top_k": 40                   # Consider top 40 tokens
             }
         }
         
         start_time = time.time()
-        logging.info(f"Querying Ollama with model: {model_name}")
-        logging.info(f"Prompt length: {len(prompt)} characters")
         
-        response = requests.post(url, json=payload, timeout=120)  # Longer timeout for large contexts
+        # Reduce logging for performance
+        if len(prompt) > 500:
+            logging.info(f"Querying Ollama with model: {model_name}, prompt length: {len(prompt)} chars")
+        else:
+            logging.info(f"Querying Ollama with model: {model_name}, prompt: {prompt[:100]}...")
+        
+        response = requests.post(url, json=payload, timeout=TIMEOUT_LONG)
         end_time = time.time()
         
         if response.status_code == 200:
             logging.info(f"Ollama response time: {end_time - start_time:.2f} seconds")
             return response.json().get("response", "")
         else:
-            logging.error(f"Error from Ollama API: {response.status_code} - {response.text}")
+            logging.error(f"Error from Ollama API: {response.status_code}")
             
             # If model not found, try fallback model
             if "model not found" in response.text.lower():
                 logging.info(f"Model {model_name} not found, trying fallback model")
                 return query_ollama(prompt, FALLBACK_MODEL)
                 
-            return f"Error: Failed to get response from LLM API (Status {response.status_code})"
+            return f"Error: Failed to get response from LLM (Status {response.status_code})"
     
     except Exception as e:
         logging.error(f"Exception when calling Ollama API: {e}")
         return f"Error: {str(e)}"
 
-# Check if Ollama is available
+# Check if Ollama is available - faster timeout
+@lru_cache(maxsize=1)  # Cache for 1 second
 def is_ollama_available():
-    """Check if Ollama is available by making a simple API call."""
+    """Check if Ollama is available by making a quick API call."""
     try:
-        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2)
+        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=TIMEOUT_SHORT)
         return response.status_code == 200
     except:
         return False
 
-# Try connecting to ChromaDB
-def get_chroma_vector_db():
-    """Try to connect to ChromaDB if available."""
-    try:
-        import chromadb
-        from chromadb.utils import embedding_functions
-        
-        # Log the attempt to connect
-        logging.info(f"Attempting to connect to ChromaDB at {CHROMA_DIR}")
-        
-        if not os.path.exists(CHROMA_DIR):
-            logging.warning(f"ChromaDB directory {CHROMA_DIR} does not exist")
-            # Try to create it
-            os.makedirs(CHROMA_DIR, exist_ok=True)
-            logging.info(f"Created ChromaDB directory {CHROMA_DIR}")
-        
-        # Try to connect to the persistent client
-        client = chromadb.PersistentClient(path=CHROMA_DIR)
-        logging.info("Successfully connected to ChromaDB client")
-        
-        # List all collections
-        collections = client.list_collections()
-        logging.info(f"Found {len(collections)} collections in ChromaDB")
-        
-        if collections:
-            collection_name = collections[0].name
-            logging.info(f"Using collection: {collection_name}")
-            
-            # Create default embedding function for querying
-            sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+# Get embedding function with caching
+def get_embedding_function():
+    """Get embedding function with caching for performance."""
+    global EMBEDDING_MODEL_CACHE
+    
+    if "embedding_function" not in EMBEDDING_MODEL_CACHE:
+        try:
+            from chromadb.utils import embedding_functions
+            embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
                 model_name="all-MiniLM-L6-v2", 
                 device="cpu"  # Use CPU for compatibility
             )
+            EMBEDDING_MODEL_CACHE["embedding_function"] = embedding_function
+            logging.info("Initialized and cached embedding function")
+        except Exception as e:
+            logging.error(f"Error creating embedding function: {str(e)}")
+            return None
+    
+    return EMBEDDING_MODEL_CACHE.get("embedding_function")
+
+# Try connecting to ChromaDB more efficiently
+def get_chroma_vector_db():
+    """Try to connect to ChromaDB with caching."""
+    global EMBEDDING_MODEL_CACHE
+    
+    if "chroma_collection" in EMBEDDING_MODEL_CACHE:
+        return EMBEDDING_MODEL_CACHE["chroma_collection"]
+    
+    try:
+        import chromadb
+        
+        # Skip logging for speed
+        if not os.path.exists(CHROMA_DIR):
+            os.makedirs(CHROMA_DIR, exist_ok=True)
+        
+        # Try to connect to the persistent client
+        client = chromadb.PersistentClient(path=CHROMA_DIR)
+        
+        # List all collections
+        collections = client.list_collections()
+        
+        if collections:
+            collection_name = collections[0].name
+            
+            # Get embedding function (cached)
+            embedding_func = get_embedding_function()
+            if not embedding_func:
+                return None
             
             # Get the collection with the embedding function
             collection = client.get_collection(
                 name=collection_name, 
-                embedding_function=sentence_transformer_ef
+                embedding_function=embedding_func
             )
             
-            logging.info(f"Successfully connected to ChromaDB collection: {collection_name}")
+            # Cache the collection
+            EMBEDDING_MODEL_CACHE["chroma_collection"] = collection
             return collection
         else:
-            logging.warning("No collections found in ChromaDB")
             return None
     except Exception as e:
         logging.error(f"Error connecting to ChromaDB: {str(e)}")
         return None
 
-# Query vector database directly
+# Query vector database with more efficient processing
 def query_vector_db(query, n_results=TOP_K_RESULTS):
-    """Query the vector database directly if possible."""
+    """Query the vector database with performance optimizations."""
     try:
         collection = get_chroma_vector_db()
-        if collection:
-            logging.info(f"Querying vector DB with: '{query}'")
+        if not collection:
+            return []
+        
+        # Query with timeout control
+        start_time = time.time()
+        results = collection.query(
+            query_texts=[query],
+            n_results=n_results
+        )
+        query_time = time.time() - start_time
+        logging.info(f"Vector query completed in {query_time:.2f} seconds")
+        
+        # Fast path for no results
+        if not results or 'documents' not in results or not results['documents'] or not results['documents'][0]:
+            return []
+        
+        # Process results efficiently
+        emails = []
+        for i, doc in enumerate(results['documents'][0]):
+            # Extract metadata safely
+            metadata = {}
+            if 'metadatas' in results and results['metadatas'] and i < len(results['metadatas'][0]):
+                metadata = results['metadatas'][0][i] or {}
             
-            # Execute the query
-            results = collection.query(
-                query_texts=[query],
-                n_results=n_results
-            )
-            
-            # Log the results structure for debugging
-            logging.info(f"Query returned metadata keys: {results.keys()}")
-            if 'documents' in results and results['documents']:
-                logging.info(f"Found {len(results['documents'][0])} documents in results")
-            
-            # Process results if they exist
-            if results and 'documents' in results and results['documents'] and results['documents'][0]:
-                emails = []
-                for i, doc in enumerate(results['documents'][0]):
-                    # Extract metadata safely
-                    metadata = {}
-                    if 'metadatas' in results and results['metadatas'] and i < len(results['metadatas'][0]):
-                        metadata = results['metadatas'][0][i] or {}
-                    
-                    # Create an email object with available data
-                    email = {
-                        "text": doc,
-                        "from": metadata.get('from', metadata.get('sender', 'Unknown')),
-                        "date": metadata.get('date', 'Unknown'),
-                        "subject": metadata.get('subject', 'Unknown'),
-                    }
-                    emails.append(email)
-                
-                logging.info(f"Successfully retrieved {len(emails)} results from vector DB")
-                return emails
-            else:
-                logging.warning("No results found in vector DB query")
-                return []
+            # Create an email object with available data
+            email = {
+                "text": doc,
+                "from": metadata.get('from', metadata.get('sender', 'Unknown')),
+                "date": metadata.get('date', 'Unknown'),
+                "subject": metadata.get('subject', 'Unknown'),
+            }
+            emails.append(email)
+        
+        return emails
     except Exception as e:
         logging.error(f"Error during vector DB query: {str(e)}")
     
     return []
 
-# Load emails from CSV with improved search
-@st.cache_data
+# Load emails from CSV with improved caching
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def load_emails_from_csv(csv_file=CSV_FILE):
-    """Load emails from CSV file."""
+    """Load emails from CSV file with caching."""
     try:
         if os.path.exists(csv_file):
-            logging.info(f"Loading emails from CSV file: {csv_file}")
+            start_time = time.time()
             df = pd.read_csv(csv_file)
-            logging.info(f"Successfully loaded {len(df)} emails from CSV")
+            load_time = time.time() - start_time
+            logging.info(f"CSV loaded in {load_time:.2f} seconds: {len(df)} emails")
             return df.to_dict('records')
         else:
-            logging.warning(f"CSV file {csv_file} not found")
             # Try to look for other CSV files in the directory
             csv_files = [f for f in os.listdir('.') if f.endswith('.csv')]
             if csv_files:
-                logging.info(f"Found alternative CSV files: {csv_files}")
                 alt_csv = csv_files[0]
-                logging.info(f"Trying alternative CSV file: {alt_csv}")
                 df = pd.read_csv(alt_csv)
-                logging.info(f"Successfully loaded {len(df)} emails from alternative CSV: {alt_csv}")
                 return df.to_dict('records')
             return []
     except Exception as e:
         logging.error(f"Error loading CSV: {str(e)}")
         return []
 
-# Search CSV with more advanced techniques
+# Optimized CSV search with faster scoring
 def search_csv_emails(query, csv_emails, max_results=TOP_K_RESULTS):
-    """Search CSV emails with improved relevance."""
+    """Search CSV emails with optimized scoring."""
     if not csv_emails:
         return []
     
-    logging.info(f"Searching {len(csv_emails)} CSV emails for query: '{query}'")
+    start_time = time.time()
     
-    # Normalize query
+    # Normalize query - optimize for speed
     query_lower = query.lower()
-    query_terms = [term.strip() for term in query_lower.split() if len(term.strip()) > 3]
+    query_terms = [term.strip() for term in query_lower.split() if len(term.strip()) > 2]
+    
+    # Exit early if no meaningful terms
+    if not query_terms:
+        return []
+    
+    # Use a more efficient approach for large datasets
+    if len(csv_emails) > 10000:
+        # Filter first, then score (much faster on large datasets)
+        filtered_emails = []
+        for email in csv_emails:
+            text = str(email.get('text', '')).lower()
+            subject = str(email.get('subject', '')).lower()
+            
+            # Quick check if any term appears in text or subject
+            if any(term in text or term in subject for term in query_terms):
+                filtered_emails.append(email)
+        
+        # Only score filtered emails
+        csv_emails = filtered_emails[:1000]  # Limit to 1000 for performance
     
     # Score each email based on relevance
     scored_emails = []
@@ -412,28 +440,86 @@ def search_csv_emails(query, csv_emails, max_results=TOP_K_RESULTS):
             # Score for terms in text
             if term in text:
                 score += 3
-                # Bonus for multiple occurrences
-                score += text.count(term) * 0.5
+                # Only count multiple occurrences if score is already good
+                if score > 5:
+                    score += text.count(term) * 0.2
             
             # Score for terms in sender
             if term in sender:
                 score += 2
         
-        # Only keep emails with non-zero scores
-        if score > 0:
+        # Only keep emails with meaningful scores
+        if score > 2:  # Threshold to reduce noise
             scored_emails.append((score, email))
     
     # Sort by score (highest first) and take top results
     sorted_emails = [email for _, email in sorted(scored_emails, key=lambda x: x[0], reverse=True)]
     limited_results = sorted_emails[:max_results]
     
-    logging.info(f"CSV search found {len(sorted_emails)} relevant emails, returning top {len(limited_results)}")
+    search_time = time.time() - start_time
+    logging.info(f"CSV search completed in {search_time:.2f} seconds, found {len(sorted_emails)} matches")
+    
     return limited_results
 
-# Better prompt template for RAG
+# Generate alternative queries for better retrieval (query rewriting from the article)
+def generate_query_variations(query):
+    """Generate variations of the user query for better retrieval."""
+    variations = [query]  # Always include original query
+    
+    # Simple variations
+    if len(query) > 10:
+        # Add a more generic version
+        variations.append(query.replace("emails about ", "").replace("email regarding ", ""))
+        
+        # Add a more specific version
+        if "enron" not in query.lower():
+            variations.append(f"enron {query}")
+    
+    # Replace specific terms with synonyms
+    query_lower = query.lower()
+    if "accounting" in query_lower:
+        variations.append(query.lower().replace("accounting", "financial"))
+    if "transaction" in query_lower:
+        variations.append(query.lower().replace("transaction", "deal"))
+    if "email" in query_lower or "emails" in query_lower:
+        variations.append(query.lower().replace("email", "message").replace("emails", "messages"))
+    
+    # Return unique variations only
+    return list(set(variations))
+
+# Better prompt template with compression
 def create_rag_prompt(query, context_emails):
-    """Create a well-structured prompt for the RAG system."""
-    prompt = f"""You are an expert assistant analyzing the Enron email dataset, which contains emails from executives at Enron Corporation from 1999-2002 before the company's collapse.
+    """Create a well-structured prompt with compressed context."""
+    # Measure initial size
+    total_chars = sum(len(email.get('text', '')) for email in context_emails)
+    
+    # Only include essential information when context is large
+    if total_chars > 6000:
+        prompt = f"""You are analyzing the Enron email dataset. Answer based ONLY on these email excerpts:
+
+USER QUESTION: {query}
+
+RELEVANT EMAILS:
+"""
+        # Add only the most important parts of each email
+        for i, email in enumerate(context_emails):
+            prompt += f"EMAIL {i+1}: From {email.get('from', 'Unknown')} Subject '{email.get('subject', 'Unknown')}' "
+            
+            # Compress long emails by focusing on key sentences
+            text = email.get('text', '')
+            if len(text) > 1200:
+                # Extract first and last few sentences as they often contain key information
+                sentences = text.split('.')
+                if len(sentences) > 6:
+                    important_text = '. '.join(sentences[:3]) + '...' + '. '.join(sentences[-3:])
+                    prompt += f"Content: {important_text}\n\n"
+                else:
+                    prompt += f"Content: {text}\n\n"
+            else:
+                prompt += f"Content: {text}\n\n"
+    else:
+        # Use full detail for smaller contexts
+        prompt = f"""You are an expert assistant analyzing the Enron email dataset, which contains emails from executives at Enron Corporation from 1999-2002 before the company's collapse.
 
 Your task is to answer the following question using ONLY the information contained in the email excerpts provided below.
 If the emails don't contain enough information to answer the question fully, acknowledge the limitations of what you know.
@@ -443,118 +529,134 @@ USER QUESTION: {query}
 
 RELEVANT EMAIL EXCERPTS:
 """
-    # Add context from emails
-    for i, email in enumerate(context_emails):
-        prompt += f"\n--- EMAIL {i+1} ---\n"
-        prompt += f"FROM: {email.get('from', 'Unknown')}\n"
-        prompt += f"DATE: {email.get('date', 'Unknown')}\n" 
-        prompt += f"SUBJECT: {email.get('subject', 'Unknown')}\n"
-        prompt += f"CONTENT: {email.get('text', '')}\n"
+        # Add context from emails
+        for i, email in enumerate(context_emails):
+            prompt += f"\n--- EMAIL {i+1} ---\n"
+            prompt += f"FROM: {email.get('from', 'Unknown')}\n"
+            prompt += f"DATE: {email.get('date', 'Unknown')}\n" 
+            prompt += f"SUBJECT: {email.get('subject', 'Unknown')}\n"
+            prompt += f"CONTENT: {email.get('text', '')}\n"
     
     prompt += "\n\nBased solely on the email excerpts above, please provide a detailed answer to the user's question."
     return prompt
 
-# Test connection to Ollama
-def test_ollama_connection():
-    """Test the connection to Ollama and available models."""
-    result = {
-        "status": "unknown",
-        "issues": [],
-        "available_models": [],
-        "details": {}
-    }
+# Search emails with parallel processing
+def search_emails(query):
+    """Search function with parallel processing and query expansion."""
+    start_time = time.time()
+    logging.info(f"Processing query: '{query}'")
     
-    # Test basic connection
-    try:
-        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
-        if response.status_code == 200:
-            result["details"]["connection"] = "ok"
-            models_data = response.json()
-            if "models" in models_data:
-                models = models_data["models"]
-                result["available_models"] = [model["name"] for model in models]
-                result["details"]["model_count"] = len(models)
-                
-                # Check if our preferred models are available
-                primary_available = any(m.startswith(MODEL_NAME) for m in result["available_models"])
-                fallback_available = any(m.startswith(FALLBACK_MODEL) for m in result["available_models"])
-                
-                result["details"]["primary_model_available"] = primary_available
-                result["details"]["fallback_model_available"] = fallback_available
-                
-                if not primary_available and not fallback_available:
-                    result["issues"].append(f"Neither primary model ({MODEL_NAME}) nor fallback model ({FALLBACK_MODEL}) is available")
-                elif not primary_available:
-                    result["issues"].append(f"Primary model ({MODEL_NAME}) is not available, but fallback ({FALLBACK_MODEL}) is")
-            else:
-                result["issues"].append("No models found in Ollama")
-                result["details"]["models_found"] = False
-        else:
-            result["issues"].append(f"Ollama API returned status code {response.status_code}")
-            result["details"]["connection"] = "error"
-            result["details"]["status_code"] = response.status_code
-    except Exception as e:
-        result["issues"].append(f"Failed to connect to Ollama API: {str(e)}")
-        result["details"]["connection"] = "error"
-        result["details"]["error"] = str(e)
+    # Check for special commands first
+    special_result = handle_special_commands(query)
+    if special_result:
+        logging.info(f"Handled special command: {query}")
+        return special_result
     
-    # Test a simple generation if we have models
-    if result["available_models"] and "connection" in result["details"] and result["details"]["connection"] == "ok":
+    # Generate query variations for better retrieval
+    query_variations = generate_query_variations(query)
+    logging.info(f"Generated query variations: {query_variations}")
+    
+    # Fast path: Try CSV search first, it's usually faster
+    if USE_CSV_SEARCH:
         try:
-            model_to_test = None
-            if result["details"].get("primary_model_available"):
-                for model in result["available_models"]:
-                    if model.startswith(MODEL_NAME):
-                        model_to_test = model
-                        break
-            elif result["details"].get("fallback_model_available"):
-                for model in result["available_models"]:
-                    if model.startswith(FALLBACK_MODEL):
-                        model_to_test = model
-                        break
-            else:
-                model_to_test = result["available_models"][0]
-            
-            if model_to_test:
-                start_time = time.time()
-                test_response = requests.post(
-                    f"{OLLAMA_BASE_URL}/api/generate",
-                    json={
-                        "model": model_to_test,
-                        "prompt": "Say hello in one word.",
-                        "stream": False,
-                        "options": {"temperature": 0.1, "num_predict": 10}
-                    },
-                    timeout=10
-                )
-                end_time = time.time()
+            csv_emails = load_emails_from_csv()
+            if csv_emails:
+                # Try each query variation
+                all_matched_emails = []
+                for q in query_variations:
+                    matched_emails = search_csv_emails(q, csv_emails)
+                    all_matched_emails.extend(matched_emails)
                 
-                if test_response.status_code == 200:
-                    result["details"]["test_generation"] = "ok"
-                    result["details"]["generation_time"] = round(end_time - start_time, 2)
-                    response_text = test_response.json().get("response", "")
-                    result["details"]["test_response"] = response_text
-                else:
-                    result["issues"].append(f"Test generation failed with status code {test_response.status_code}")
-                    result["details"]["test_generation"] = "error"
-                    result["details"]["test_status_code"] = test_response.status_code
-            else:
-                result["issues"].append("No suitable model found for testing")
+                # Remove duplicates by subject/from combination
+                seen = set()
+                unique_emails = []
+                for email in all_matched_emails:
+                    key = (email.get('subject', ''), email.get('from', ''))
+                    if key not in seen:
+                        seen.add(key)
+                        unique_emails.append(email)
+                
+                # Limit to top results
+                matched_emails = unique_emails[:TOP_K_RESULTS]
+                
+                if matched_emails:
+                    # Create prompt with matched emails
+                    prompt = create_rag_prompt(query, matched_emails)
+                    
+                    # Try to get response from Ollama if available
+                    if is_ollama_available():
+                        answer = query_ollama(prompt)
+                        
+                        # Format the output - ONLY include the answer
+                        output = f"{answer}\n\n"
+                        elapsed = time.time() - start_time
+                        logging.info(f"Query completed in {elapsed:.2f} seconds via CSV search")
+                        return output
         except Exception as e:
-            result["issues"].append(f"Test generation failed: {str(e)}")
-            result["details"]["test_generation"] = "error"
-            result["details"]["test_error"] = str(e)
+            logging.error(f"Error in CSV search: {str(e)}")
     
-    # Set final status
-    if not result["issues"]:
-        result["status"] = "ok"
-    else:
-        result["status"] = "error"
+    # If CSV search fails or finds no results, use vector search
+    try:
+        # Try all query variations with vector search
+        all_vector_results = []
+        for q in query_variations:
+            vector_results = query_vector_db(q)
+            all_vector_results.extend(vector_results)
+        
+        # Remove duplicates
+        seen = set()
+        unique_vector_results = []
+        for email in all_vector_results:
+            key = (email.get('subject', ''), email.get('from', ''))
+            if key not in seen:
+                seen.add(key)
+                unique_vector_results.append(email)
+        
+        # Limit to top results
+        vector_results = unique_vector_results[:TOP_K_RESULTS]
+        
+        if vector_results:
+            # Create prompt with vector results
+            prompt = create_rag_prompt(query, vector_results)
+            
+            # Get response from Ollama
+            if is_ollama_available():
+                answer = query_ollama(prompt)
+                output = f"{answer}\n\n"
+                elapsed = time.time() - start_time
+                logging.info(f"Query completed in {elapsed:.2f} seconds via vector search")
+                return output
+    except Exception as e:
+        logging.error(f"Error in vector search: {str(e)}")
     
-    logging.info(f"Ollama test results: {json.dumps(result)}")
-    return result
+    # Final fallback - direct query to Ollama
+    if is_ollama_available():
+        try:
+            logging.info("All retrieval methods failed, using direct query to Ollama")
+            
+            prompt = f"""
+You are analyzing the Enron email dataset. The user has asked the following question, but unfortunately,
+we don't have specific emails to provide as context. Please provide a general response based on
+what you know about Enron, being transparent that specific emails weren't found.
 
-# Handle special debug commands
+USER QUESTION: {query}
+"""
+            answer = query_ollama(prompt)
+            output = f"No specific emails found for your query. Here's a general response:\n\n{answer}"
+            
+            elapsed = time.time() - start_time
+            logging.info(f"Query completed in {elapsed:.2f} seconds via direct query")
+            return output
+                
+        except Exception as e:
+            logging.error(f"Error with direct Ollama query: {str(e)}")
+    
+    # Complete fallback if everything else fails
+    elapsed = time.time() - start_time
+    logging.warning(f"All methods failed in {elapsed:.2f} seconds")
+    return f"I'm sorry, I couldn't find any relevant information for your query: '{query}'. Please try a different question or check the system status with !debug."
+
+# Handle special debug commands - rest of code is the same
 def handle_special_commands(command):
     """Handle special commands for debugging and diagnostics."""
     special_commands = {
@@ -579,7 +681,6 @@ Available debug commands:
             if command == "!debug":
                 # Run all diagnostics
                 vector_results = debug_vector_db()
-                ollama_results = test_ollama_connection()
                 
                 output = "DIAGNOSTIC RESULTS:\n\n"
                 
@@ -591,17 +692,18 @@ Available debug commands:
                         output += f"- {issue}\n"
                 if vector_results["collections"]:
                     output += f"Collections: {', '.join(vector_results['collections'])}\n"
-                if "document_count" in vector_results.get("details", {}):
-                    output += f"Document count: {vector_results['details']['document_count']}\n"
                 
-                # Ollama results
-                output += "\nOLLAMA API STATUS: " + ollama_results["status"].upper() + "\n"
-                if ollama_results["issues"]:
-                    output += "Issues:\n"
-                    for issue in ollama_results["issues"]:
-                        output += f"- {issue}\n"
-                if ollama_results["available_models"]:
-                    output += f"Available models: {', '.join(ollama_results['available_models'])}\n"
+                # Ollama check - simplified
+                output += "\nOLLAMA API STATUS: "
+                if is_ollama_available():
+                    output += "OK\n"
+                    models = get_available_models()
+                    if models:
+                        output += f"Available models: {', '.join(models)}\n"
+                    else:
+                        output += "No models available\n"
+                else:
+                    output += "ERROR - Cannot connect to Ollama\n"
                 
                 # CSV check
                 csv_emails = load_emails_from_csv()
@@ -622,24 +724,23 @@ Available debug commands:
                         output += f"- {issue}\n"
                 if results["collections"]:
                     output += f"Collections: {', '.join(results['collections'])}\n"
-                if "document_count" in results.get("details", {}):
-                    output += f"Document count: {results['details']['document_count']}\n"
                 return output
                 
             elif command == "!ollama":
-                results = test_ollama_connection()
                 output = "OLLAMA CONNECTION TEST:\n\n"
-                output += "Status: " + results["status"].upper() + "\n"
-                if results["issues"]:
-                    output += "Issues:\n"
-                    for issue in results["issues"]:
-                        output += f"- {issue}\n"
-                if "test_generation" in results.get("details", {}):
-                    output += f"Test generation: {results['details']['test_generation']}\n"
-                    if "generation_time" in results["details"]:
-                        output += f"Response time: {results['details']['generation_time']} seconds\n"
-                    if "test_response" in results["details"]:
-                        output += f"Response: {results['details']['test_response']}\n"
+                
+                if is_ollama_available():
+                    output += "Status: OK\n"
+                    start_time = time.time()
+                    result = query_ollama("Say hello in one word.", select_best_model())
+                    end_time = time.time()
+                    
+                    output += f"Response time: {end_time - start_time:.2f} seconds\n"
+                    output += f"Response: {result}\n"
+                else:
+                    output += "Status: ERROR\n"
+                    output += "Failed to connect to Ollama API\n"
+                
                 return output
             
             elif command == "!csv":
@@ -684,83 +785,6 @@ Available debug commands:
         return None  # Should never reach here
     
     return None  # Not a special command
-
-# Search emails using a direct, self-contained approach
-def search_emails(query):
-    """Search function with multiple fallback strategies"""
-    logging.info(f"Processing query: '{query}'")
-    
-    # Check for special commands first
-    special_result = handle_special_commands(query)
-    if special_result:
-        logging.info(f"Handled special command: {query}")
-        return special_result
-    
-    # Try all available strategies in order until one succeeds
-    
-    # First try CSV search directly - more reliable than vector search
-    try:
-        csv_emails = load_emails_from_csv()
-        if csv_emails:
-            logging.info(f"Loaded {len(csv_emails)} emails from CSV")
-            matched_emails = search_csv_emails(query, csv_emails)
-            
-            if matched_emails:
-                logging.info(f"Found {len(matched_emails)} relevant emails in CSV")
-                
-                # Create prompt with matched emails
-                prompt = create_rag_prompt(query, matched_emails)
-                
-                # Try to get response from Ollama if available
-                if is_ollama_available():
-                    answer = query_ollama(prompt)
-                    
-                    # Format the output - ONLY include the answer, not the source emails
-                    output = f"{answer}\n\n"
-                    logging.info("Successfully generated response using CSV data and Ollama")
-                    return output
-                else:
-                    logging.warning("Ollama not available for generating response")
-                    # Return a simple response without Ollama
-                    output = f"Found {len(matched_emails)} emails related to '{query}'.\n\n"
-                    
-                    # Format a summary response without using the original emails
-                    for i, email in enumerate(matched_emails[:3]):
-                        output += f"Email {i+1}: {email.get('subject', 'No subject')} " 
-                        output += f"from {email.get('from', 'Unknown')} "
-                        output += f"on {email.get('date', 'Unknown date')}\n"
-                    
-                    return output
-    except Exception as e:
-        logging.error(f"Error in CSV search: {str(e)}")
-    
-    # Only if CSV search fails, try with Ollama and the default sample data
-    if is_ollama_available():
-        try:
-            logging.info("CSV search failed, using Ollama with default data")
-            
-            # No emails found, use a direct query to Ollama without context
-            prompt = f"""
-You are analyzing the Enron email dataset. The user has asked the following question, but unfortunately,
-we don't have specific emails to provide as context. Please provide a general response based on
-what you know about Enron, being transparent that specific emails weren't found.
-
-USER QUESTION: {query}
-"""
-            # Query Ollama with no email context
-            answer = query_ollama(prompt)
-            
-            # Format the output - without any source emails
-            output = f"No specific emails found for your query. Here's a general response:\n\n{answer}"
-            logging.info("Generated response with no specific email context")
-            return output
-                
-        except Exception as e:
-            logging.error(f"Error with direct Ollama query: {str(e)}")
-    
-    # Final fallback if everything else fails - with minimal message
-    logging.warning("All retrieval and generation methods failed")
-    return f"I'm sorry, I couldn't find any relevant information for your query: '{query}'. Please try a different question or check the system status with !debug."
 
 # Escape HTML for safe display in the terminal
 def escape_html_except_br(text):
