@@ -15,7 +15,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
 # Log startup for debugging
 logging.info("========== APPLICATION STARTED ==========")
 
-# Hardcoded sample data
+# Hardcoded sample data used by search_emails() in simple (non-RAG) mode.
+# These five emails represent key figures and events in the Enron scandal and
+# allow the app to answer common queries without any external dependencies.
 SAMPLE_DATA = [
     {"from": "kenneth.lay@enron.com", "to": "all.employees@enron.com", 
      "subject": "Welcome Message", "date": "2001-05-01", 
@@ -38,90 +40,131 @@ SAMPLE_DATA = [
      "text": "We need to focus on our core business and maintain strong relationships with our partners. Our expansion strategy must be carefully considered. I believe in building businesses with hard assets rather than just trading operations. Long-term success requires solid infrastructure."}
 ]
 
+def _load_email_corpus():
+    """Load emails from the best available source on disk, falling back to SAMPLE_DATA.
+
+    Checks for a CSV in this order:
+      1. data/enron_emails.csv  (built by: python process_enron_data.py --sample)
+      2. emails.csv             (the full Kaggle Enron dataset in the project root)
+
+    Returns:
+        list[dict]: List of email dicts with keys from, to, subject, date, text.
+    """
+    csv_candidates = ["data/enron_emails.csv", "emails.csv"]
+    content_col_candidates = ["content", "message", "body", "text"]
+
+    for path in csv_candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_csv(path, on_bad_lines="skip")
+            content_col = next((c for c in content_col_candidates if c in df.columns), None)
+            if content_col is None:
+                logging.warning(f"{path}: no recognised content column, skipping")
+                continue
+            emails = []
+            for _, row in df.iterrows():
+                emails.append({
+                    "from":    str(row.get("from",    "")),
+                    "to":      str(row.get("to",      "")),
+                    "subject": str(row.get("subject", "")),
+                    "date":    str(row.get("date",    "")),
+                    "text":    str(row.get(content_col, "")),
+                })
+            logging.info(f"Loaded {len(emails)} emails from {path}")
+            return emails
+        except Exception as e:
+            logging.warning(f"Could not load {path}: {e}")
+
+    logging.info("No CSV found — using built-in 5-email sample")
+    return SAMPLE_DATA
+
+
+# Load the email corpus once at startup so every search call can use it.
+_EMAIL_CORPUS = _load_email_corpus()
+
+
 def search_emails(query):
-    """Simple search function that searches the sample data"""
-    query = query.lower()
+    """Search the email corpus by keyword relevance and return the top results.
+
+    Scores each email by counting how many query words appear in its subject
+    and body, then returns the top 3 matches with their actual text.
+
+    Args:
+        query (str): The user's natural-language question or keyword string.
+
+    Returns:
+        str: Formatted terminal output showing matching emails.
+    """
     logging.info(f"Processing query: {query}")
-    answer = ""
-    sources = []
-    
-    # Handle special cases
-    if "ceo" in query or "kenneth lay" in query:
-        answer = "Kenneth Lay was the CEO of Enron Corporation from 1986 to 2001. He founded the company and led it until its bankruptcy following accounting scandals."
-        sources = [email for email in SAMPLE_DATA if "kenneth.lay" in email["from"].lower()]
-        if not sources:
-            sources = [SAMPLE_DATA[0]]
-            
-    elif "skilling" in query or "president" in query or "coo" in query:
-        answer = "Jeffrey Skilling was the President and Chief Operating Officer (COO) of Enron, later becoming CEO after Kenneth Lay stepped down. He was one of the key figures in the company's downfall."
-        sources = [email for email in SAMPLE_DATA if "skilling" in email["from"].lower()]
-        if not sources:
-            sources = [SAMPLE_DATA[1]]
-            
-    elif "fastow" in query or "cfo" in query or "financial" in query:
-        answer = "Andrew Fastow was the Chief Financial Officer (CFO) of Enron. He was responsible for creating the off-balance-sheet special purpose entities used to hide Enron's debts and losses."
-        sources = [email for email in SAMPLE_DATA if "fastow" in email["from"].lower()]
-        if not sources:
-            sources = [SAMPLE_DATA[2]]
-            
-    elif "scandal" in query or "fraud" in query or "bankruptcy" in query:
-        answer = "The Enron scandal, revealed in 2001, involved systematic accounting fraud that led to the company's bankruptcy. It was one of the largest corporate scandals in U.S. history, and resulted in the dissolution of Arthur Andersen, one of the five largest audit and accountancy partnerships in the world."
-        sources = [email for email in SAMPLE_DATA if "scandal" in email["text"].lower() or "accounting" in email["text"].lower()]
-        if not sources:
-            sources = [SAMPLE_DATA[3]]
-    
-    # General search
+    query_words = [w for w in query.lower().split() if len(w) > 2]
+
+    # Score every email by total query-word hits across subject + body + sender
+    scored = []
+    for email in _EMAIL_CORPUS:
+        haystack = " ".join([
+            email.get("subject", ""),
+            email.get("text", ""),
+            email.get("from", ""),
+        ]).lower()
+        score = sum(haystack.count(w) for w in query_words)
+        if score > 0:
+            scored.append((score, email))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [e for _, e in scored[:3]]
+
+    if not top:
+        output = f"No emails matched '{query}' in the archive. Showing recent emails:\n\n"
+        top = _EMAIL_CORPUS[:3]
     else:
-        sources = [email for email in SAMPLE_DATA if query in email["text"].lower()]
-        if not sources:
-            # Try word by word
-            for word in query.split():
-                if len(word) > 3:  # Only use words longer than 3 chars
-                    word_sources = [email for email in SAMPLE_DATA if word in email["text"].lower()]
-                    if word_sources:
-                        sources = word_sources
-                        break
-        
-        if not sources:
-            sources = SAMPLE_DATA[:3]
-            answer = f"I couldn't find exact matches for '{query}', but here are some important Enron emails."
-        else:
-            answer = f"Found {len(sources)} emails related to '{query}'."
-    
-    # Limit results
-    sources = sources[:3]
-    
-    # Format output
-    output = answer + "\n\n"
-    
-    if sources:
-        output += "SOURCE EMAILS:\n"
-        for i, email in enumerate(sources):
-            output += f"EMAIL {i+1}:\n"
-            output += f"FROM: {email['from']}\n"
-            output += f"DATE: {email['date']}\n"
-            output += f"SUBJECT: {email['subject']}\n"
-            output += "-----\n"
-            
-            # Format the email text
-            text = email['text']
-            output += text + "\n\n"
-    
-    logging.info(f"Generated response for query: {query}")
+        output = f"Found {len(scored)} matching email(s). Top results:\n\n"
+
+    for i, email in enumerate(top):
+        output += f"EMAIL {i + 1}:\n"
+        output += f"FROM:    {email.get('from', 'Unknown')}\n"
+        output += f"TO:      {email.get('to', 'Unknown')}\n"
+        output += f"DATE:    {email.get('date', 'Unknown')}\n"
+        output += f"SUBJECT: {email.get('subject', '(no subject)')}\n"
+        output += "-" * 40 + "\n"
+        text = email.get("text", "")
+        if len(text) > 800:
+            text = text[:800] + "\n...[truncated]"
+        output += text + "\n\n"
+
+    logging.info(f"Returned {len(top)} results for query: {query}")
     return output
 
 # Escape HTML for safe display in the terminal
 def escape_html_except_br(text):
+    """Escape HTML special characters in text, then convert newlines to <br> tags.
+
+    This prevents XSS when user-supplied content or email bodies are injected
+    into the terminal's innerHTML. Newlines are preserved as visible line breaks.
+
+    Args:
+        text (str): Raw text that may contain HTML special characters.
+
+    Returns:
+        str: HTML-safe text with newlines replaced by <br>.
+    """
     escaped = html.escape(text).replace('\n', '<br>')
     return escaped
 
 # Initialize session state
+# terminal_history: list of (type, content) tuples representing every line
+#   displayed in the terminal. type is one of "command", "response", "message".
+#   Persists across Streamlit rerenders so the full session is visible.
 if 'terminal_history' not in st.session_state:
     st.session_state.terminal_history = []
 
+# startup_done: guards the one-time ASCII banner / boot sequence so it is
+#   only appended to terminal_history on the very first render.
 if 'startup_done' not in st.session_state:
     st.session_state.startup_done = False
 
+# command_counter: incremented after each command is processed; causes
+#   Streamlit to re-render the component and display the updated history.
 if 'command_counter' not in st.session_state:
     st.session_state.command_counter = 0
 
@@ -255,7 +298,22 @@ for msg_type, content in st.session_state.terminal_history:
     elif msg_type == "message":
         history_html += f'<div class="terminal-line message">{html.escape(content)}</div>\n'
 
-# FULL CUSTOM HTML TERMINAL
+# ---------------------------------------------------------------------------
+# HTML/CSS/JS TERMINAL
+#
+# The entire UI is a self-contained HTML document rendered inside an iframe
+# via st.components.v1.html().  Streamlit itself is hidden with CSS overrides
+# above; only this component is visible.
+#
+# Architecture:
+#   - Python builds `history_html` (a string of <div> elements) from
+#     st.session_state.terminal_history and embeds it as an f-string below.
+#   - The <input> element captures keystrokes.  On Enter, submitCommand()
+#     redirects the parent page to ?command=<value>, which triggers a full
+#     Streamlit rerender with the new command in st.query_params.
+#   - The scanlines <div> is a purely cosmetic CSS overlay that mimics the
+#     horizontal scan lines of a CRT monitor.
+# ---------------------------------------------------------------------------
 terminal_html = f"""
 <!DOCTYPE html>
 <html>

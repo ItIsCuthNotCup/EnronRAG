@@ -11,10 +11,15 @@ def clean_email_body(body):
     if not body:
         return ""
     
-    # Remove email forwarding markers
+    # Remove forwarding headers such as:
+    #   "---------------------- Forwarded by John Doe/Enron ------------------"
+    # The pattern is case-insensitive and spans the full header line.
     body = re.sub(r'(?i)-+\s*forwarded\s+by.*?-+', ' ', body)
-    
-    # Remove email signatures
+
+    # Remove email signatures that begin with a separator line of two or more
+    # dashes, underscores, or asterisks (e.g. "-- " or "***") followed by a
+    # newline.  DOTALL makes . match newlines so the entire trailing block is
+    # removed in one pass.
     body = re.sub(r'(?i)^[-_*]{2,}[\r\n].*', '', body, flags=re.MULTILINE|re.DOTALL)
     
     # Remove multiple newlines
@@ -36,7 +41,8 @@ def clean_header_field(field):
     # Remove any newlines
     field = re.sub(r'[\r\n]+', ' ', field)
     
-    # Remove excess whitespace
+    # Collapse runs of two or more whitespace characters (including tabs) to a
+    # single space so header fields are stored in a normalised form.
     field = re.sub(r'\s{2,}', ' ', field)
     
     return field.strip()

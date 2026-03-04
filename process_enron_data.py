@@ -44,7 +44,7 @@ SOURCE_DATA_PATHS = [
     # Other possible locations
     "../emails.csv",
     "../../emails.csv",
-    # User-specified path - Move to last priority
+    # TODO: remove this Windows-specific hardcoded path before deploying on other machines
     r"C:\Users\Jacob\OneDrive\Desktop\Georgia Tech\Spring 2025\CSE 6242\GROUP PROJECT\emails.csv"
 ]
 
@@ -69,7 +69,12 @@ def setup_directories():
         logging.info(f"Directory {directory} created/verified")
 
 def find_source_data():
-    """Find the Enron dataset from potential locations."""
+    """Search SOURCE_DATA_PATHS in order and return the first path that exists.
+
+    Returns:
+        str | None: Absolute or relative path to a readable emails.csv, or
+            None if no candidate path exists on disk.
+    """
     for path in SOURCE_DATA_PATHS:
         if os.path.exists(path):
             print_step(f"Found dataset at: {path}", "OK")
@@ -82,7 +87,19 @@ def find_source_data():
     return None
 
 def copy_dataset(source_path):
-    """Copy the dataset from source to data directory."""
+    """Copy the source CSV into the project's data directory with progress reporting.
+
+    If the target file already exists it is reused without re-copying.  For
+    large files the copy is performed in 1 MB chunks so progress can be
+    printed to stdout.
+
+    Args:
+        source_path (str): Path to the source emails.csv file.
+
+    Returns:
+        str | None: Path to the copied file inside DATA_DIR, or None if the
+            copy failed.
+    """
     target_file = os.path.join(DATA_DIR, "enron_emails.csv")
     
     # Check if the file already exists in our data directory
@@ -136,7 +153,28 @@ def copy_dataset(source_path):
         return None
 
 def process_dataset(csv_path):
-    """Process the dataset and create vector embeddings."""
+    """Load a CSV of emails, chunk the text, embed it, and persist a ChromaDB vector store.
+
+    The function is idempotent: if a complete ChromaDB database already exists
+    at CHROMA_DIR it logs its size and returns True without rebuilding.
+
+    Processing steps:
+        1. Load the CSV with pandas and optionally down-sample to at most
+           25,000 rows (see inline comments for rationale).
+        2. Wrap each row in a LangChain Document using DataFrameLoader.
+        3. Split documents with RecursiveCharacterTextSplitter (chunk size and
+           overlap come from config.py).
+        4. Initialise a HuggingFaceEmbeddings model (EMBEDDING_MODEL in config).
+        5. Insert chunks into ChromaDB in batches of MAX_BATCH_SIZE and persist
+           after every batch to guard against OOM on large datasets.
+
+    Args:
+        csv_path (str): Path to the email CSV file to process.
+
+    Returns:
+        bool: True if the vector database was created or already existed,
+            False if any step failed.
+    """
     try:
         # Create vector database directory if it doesn't exist
         os.makedirs(VECTOR_DB_DIR, exist_ok=True)
@@ -191,9 +229,11 @@ def process_dataset(csv_path):
             print_step(f"Error loading CSV: {str(e)}", "ERROR")
             return False
         
-        # Use more emails for better context - up to 25,000 for better performance
-        min_sample_size = 1000  # Minimum number of emails for a useful RAG system
-        target_sample_size = min(25000, len(df))  # Reduced target sample size for better performance
+        # Cap the dataset to keep embedding time and ChromaDB size manageable.
+        # 1,000 emails is the practical minimum for meaningful semantic search;
+        # 25,000 balances retrieval quality against memory and processing time.
+        min_sample_size = 1000  # Warn if the dataset is smaller than this
+        target_sample_size = min(25000, len(df))  # Upper cap; random-sampled with seed 42
         
         if len(df) < min_sample_size:
             print_step(f"Warning: Dataset only has {len(df)} emails, which is smaller than recommended ({min_sample_size})", "WARN")
