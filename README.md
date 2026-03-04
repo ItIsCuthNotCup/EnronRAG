@@ -25,9 +25,11 @@ For a detailed architecture breakdown see [CLAUDE.md](CLAUDE.md).
 ### Simple mode (no Ollama required)
 
 ```bash
+git clone https://github.com/ItIsCuthNotCup/EnronRAG.git
+cd EnronRAG
 pip install streamlit pandas requests
 streamlit run app.py
-# Opens http://localhost:8501
+# Opens http://localhost:8501 in your browser automatically
 ```
 
 Type any question at the `$` prompt and press Enter.
