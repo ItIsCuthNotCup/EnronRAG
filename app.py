@@ -15,7 +15,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
 # Log startup for debugging
 logging.info("========== APPLICATION STARTED ==========")
 
-# Hardcoded sample data
+# Hardcoded sample data used by search_emails() in simple (non-RAG) mode.
+# These five emails represent key figures and events in the Enron scandal and
+# allow the app to answer common queries without any external dependencies.
 SAMPLE_DATA = [
     {"from": "kenneth.lay@enron.com", "to": "all.employees@enron.com", 
      "subject": "Welcome Message", "date": "2001-05-01", 
@@ -112,16 +114,34 @@ def search_emails(query):
 
 # Escape HTML for safe display in the terminal
 def escape_html_except_br(text):
+    """Escape HTML special characters in text, then convert newlines to <br> tags.
+
+    This prevents XSS when user-supplied content or email bodies are injected
+    into the terminal's innerHTML. Newlines are preserved as visible line breaks.
+
+    Args:
+        text (str): Raw text that may contain HTML special characters.
+
+    Returns:
+        str: HTML-safe text with newlines replaced by <br>.
+    """
     escaped = html.escape(text).replace('\n', '<br>')
     return escaped
 
 # Initialize session state
+# terminal_history: list of (type, content) tuples representing every line
+#   displayed in the terminal. type is one of "command", "response", "message".
+#   Persists across Streamlit rerenders so the full session is visible.
 if 'terminal_history' not in st.session_state:
     st.session_state.terminal_history = []
 
+# startup_done: guards the one-time ASCII banner / boot sequence so it is
+#   only appended to terminal_history on the very first render.
 if 'startup_done' not in st.session_state:
     st.session_state.startup_done = False
 
+# command_counter: incremented after each command is processed; causes
+#   Streamlit to re-render the component and display the updated history.
 if 'command_counter' not in st.session_state:
     st.session_state.command_counter = 0
 
@@ -255,7 +275,22 @@ for msg_type, content in st.session_state.terminal_history:
     elif msg_type == "message":
         history_html += f'<div class="terminal-line message">{html.escape(content)}</div>\n'
 
-# FULL CUSTOM HTML TERMINAL
+# ---------------------------------------------------------------------------
+# HTML/CSS/JS TERMINAL
+#
+# The entire UI is a self-contained HTML document rendered inside an iframe
+# via st.components.v1.html().  Streamlit itself is hidden with CSS overrides
+# above; only this component is visible.
+#
+# Architecture:
+#   - Python builds `history_html` (a string of <div> elements) from
+#     st.session_state.terminal_history and embeds it as an f-string below.
+#   - The <input> element captures keystrokes.  On Enter, submitCommand()
+#     redirects the parent page to ?command=<value>, which triggers a full
+#     Streamlit rerender with the new command in st.query_params.
+#   - The scanlines <div> is a purely cosmetic CSS overlay that mimics the
+#     horizontal scan lines of a CRT monitor.
+# ---------------------------------------------------------------------------
 terminal_html = f"""
 <!DOCTYPE html>
 <html>
