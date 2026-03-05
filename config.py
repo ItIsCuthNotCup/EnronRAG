@@ -28,3 +28,28 @@ MODEL_NAME = "llama3:8b"
 # When True, the backend falls back to direct CSV search instead of ChromaDB.
 # Useful for debugging without a built vector database.
 USE_CSV_SEARCH = False
+
+# FastAPI server settings
+API_HOST = "127.0.0.1"
+API_PORT = 8000
+
+# Sentence-transformer model used to embed queries and email chunks.
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+# Device for embedding inference. "cpu" is the safe default; set to "cuda"
+# if a CUDA-capable GPU is available.
+EMBEDDING_DEVICE = "cpu"
+
+# Number of chunks processed per batch during embedding.
+EMBEDDING_BATCH_SIZE = 32
+
+# Directories used by process_enron_data.py
+DATA_DIR = "data"
+PROCESSED_DIR = "data/processed"
+
+# LangChain text-splitter settings for chunking emails.
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 50
+
+# Maximum number of document chunks inserted into ChromaDB per batch.
+MAX_BATCH_SIZE = 500

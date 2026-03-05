@@ -44,8 +44,6 @@ SOURCE_DATA_PATHS = [
     # Other possible locations
     "../emails.csv",
     "../../emails.csv",
-    # TODO: remove this Windows-specific hardcoded path before deploying on other machines
-    r"C:\Users\Jacob\OneDrive\Desktop\Georgia Tech\Spring 2025\CSE 6242\GROUP PROJECT\emails.csv"
 ]
 
 def print_step(message, step_type="INFO"):

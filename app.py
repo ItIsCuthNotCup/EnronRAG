@@ -293,7 +293,7 @@ for msg_type, content in st.session_state.terminal_history:
     if msg_type == "command":
         history_html += f'<div class="terminal-line command">$ {html.escape(content)}</div>\n'
     elif msg_type == "response":
-        formatted_content = content.replace('\n', '<br>')
+        formatted_content = escape_html_except_br(content)
         history_html += f'<div class="terminal-line response">{formatted_content}</div>\n'
     elif msg_type == "message":
         history_html += f'<div class="terminal-line message">{html.escape(content)}</div>\n'
