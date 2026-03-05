@@ -2,10 +2,23 @@ import logging
 import json
 import requests
 from pathlib import Path
+from urllib.parse import urlparse
 import time
 
 # Import configuration
 from config import OLLAMA_BASE_URL, MODEL_NAME
+
+
+def _validate_ollama_url(url: str) -> str:
+    """Validate that the Ollama base URL uses an allowed scheme and has a host."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"Invalid Ollama URL scheme '{parsed.scheme}'. Must be 'http' or 'https'."
+        )
+    if not parsed.netloc:
+        raise ValueError("Invalid Ollama URL: missing host.")
+    return url
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +34,7 @@ class RAGEngine:
         """
         self.embedder = embedder
         self.vector_db = vector_db
-        self.ollama_base_url = ollama_base_url.rstrip("/")
+        self.ollama_base_url = _validate_ollama_url(ollama_base_url.rstrip("/"))
         self.model_name = model_name
         
         # Cache for query results to improve speed for repeated queries
@@ -118,8 +131,11 @@ ANSWER:
     def retrieve_and_generate(self, query, top_k=5):
         """Retrieve relevant documents and generate an answer."""
         try:
-            # Check cache first for faster responses
-            cache_key = f"{query}_{top_k}"
+            # Check cache first for faster responses.
+            # Use a tuple key to avoid collisions between query strings that
+            # contain underscores and adjacent top_k digits (e.g. "a_5" with
+            # top_k=0 vs "a" with top_k=50 would hash identically as strings).
+            cache_key = (query, top_k)
             if cache_key in self.query_cache:
                 logger.info(f"Using cached result for query: {query}")
                 return self.query_cache[cache_key]

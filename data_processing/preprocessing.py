@@ -13,8 +13,9 @@ def clean_email_body(body):
     
     # Remove forwarding headers such as:
     #   "---------------------- Forwarded by John Doe/Enron ------------------"
-    # The pattern is case-insensitive and spans the full header line.
-    body = re.sub(r'(?i)-+\s*forwarded\s+by.*?-+', ' ', body)
+    # The middle section is capped at 300 characters to prevent backtracking
+    # on pathological input that has leading dashes but no closing dashes.
+    body = re.sub(r'(?i)-+\s*forwarded\s+by[^-]{0,300}-+', ' ', body)
 
     # Remove email signatures that begin with a separator line of two or more
     # dashes, underscores, or asterisks (e.g. "-- " or "***") followed by a

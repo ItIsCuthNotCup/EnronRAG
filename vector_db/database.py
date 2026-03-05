@@ -32,7 +32,7 @@ class VectorDatabase:
         try:
             self.collection = self.chroma_client.get_collection(self.collection_name)
             logger.info(f"Found existing collection with {self.collection.count()} documents")
-        except:
+        except Exception:
             logger.info(f"Creating new collection: {self.collection_name}")
             self.collection = self.chroma_client.create_collection(self.collection_name)
     
